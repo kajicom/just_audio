@@ -1220,7 +1220,9 @@ class AudioPlayer {
       AudioPlayerPlatform platform, _PlayRequest? playRequest) async {
     final request = playRequest ?? _playRequest;
     if (!playing || (request != null && !identical(_playRequest, request))) {
-      _finishPlay(request);
+      // Cancellation already completes a Play that has not reached the native
+      // player. Once native Play starts, its reply or the cancelling command
+      // completes the request after stopping; a delayed startup cannot do so.
       return;
     }
     try {
@@ -1893,6 +1895,10 @@ class AudioPlayer {
       if (identical(_platform, platformReady)) {
         _active = false;
         _platformLoading = false;
+        // Play accepted before a source exists is waiting for loading to start
+        // playback. Native setup failure must reach that Play too, even though
+        // _startPlay returned without waiting for a platform.
+        _finishPlay(_playRequest, error: error, stack: stack);
       }
       Error.throwWithStackTrace(error, stack);
     });

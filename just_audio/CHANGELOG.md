@@ -12,6 +12,8 @@ commands immediately, shares concurrent cleanup and permits retry after failure.
 Disposal waits for event forwarding before closing derived state streams.
 Replacing a file during initial media loading preserves Play and the native
 player. Superseded loading calls stop before issuing another native load.
+Cancelling Play during loading waits for native stopping, and native setup
+failure also reaches a Play accepted before a source was assigned.
 
 ## 0.10.6
 
