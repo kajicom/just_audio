@@ -1424,6 +1424,18 @@ void runTests() {
     expect(nativePlayer._playing, false);
   });
 
+  test('Dispose closes derived playback and sequence streams', () async {
+    final player = AudioPlayer();
+    final streamsClosed = Future.wait([
+      player.durationStream.drain<void>(),
+      player.playingStream.drain<void>(),
+      player.currentIndexStream.drain<void>(),
+      player.playerStateStream.drain<void>(),
+    ]);
+    await player.dispose();
+    await streamsClosed;
+  });
+
   test('Dispose cancels native streams before releasing the player', () async {
     final player = AudioPlayer();
     await player.setUrl('https://bar.bar/foo.mp3');

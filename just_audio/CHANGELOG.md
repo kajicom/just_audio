@@ -9,6 +9,7 @@ platform does not implement disposePlayer.
 Play reports startup failures and completes when Pause, Stop or Dispose cancels
 startup. Loading and Play share one native Play operation. Dispose disables
 commands immediately, shares concurrent cleanup and permits retry after failure.
+Disposal waits for event forwarding before closing derived state streams.
 
 ## 0.10.6
 

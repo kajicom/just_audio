@@ -60,6 +60,10 @@ class AudioPlayer {
   final _lock = Lock(reentrant: true);
   Future<void>? _playbackEventPipe;
 
+  // Derived state streams finish forwarding after their input streams close.
+  // Dispose awaits these connections before closing their destination subjects.
+  final _derivedEventPipes = <Future<void>>[];
+
   /// The user agent to set on all HTTP requests.
   final String? _userAgent;
 
@@ -292,16 +296,16 @@ class AudioPlayer {
     }
     _playbackEventPipe = _playbackEventSubject.addStream(
         playerEventStream.map((event) => event.playbackEvent).distinct());
-    _playingSubject
-        .addStream(playerEventStream.map((event) => event.playing).distinct());
-    _durationSubject.addStream(
-        playbackEventStream.map((event) => event.duration).distinct());
-    _processingStateSubject.addStream(
-        playbackEventStream.map((event) => event.processingState).distinct());
-    _bufferedPositionSubject.addStream(
-        playbackEventStream.map((event) => event.bufferedPosition).distinct());
-    _icyMetadataSubject.addStream(
-        playbackEventStream.map((event) => event.icyMetadata).distinct());
+    _derivedEventPipes.add(_playingSubject
+        .addStream(playerEventStream.map((event) => event.playing).distinct()));
+    _derivedEventPipes.add(_durationSubject.addStream(
+        playbackEventStream.map((event) => event.duration).distinct()));
+    _derivedEventPipes.add(_processingStateSubject.addStream(
+        playbackEventStream.map((event) => event.processingState).distinct()));
+    _derivedEventPipes.add(_bufferedPositionSubject.addStream(
+        playbackEventStream.map((event) => event.bufferedPosition).distinct()));
+    _derivedEventPipes.add(_icyMetadataSubject.addStream(
+        playbackEventStream.map((event) => event.icyMetadata).distinct()));
     _positionDiscontinuitySubscription = playbackEventStream
         .map((event) => (
               event,
@@ -343,22 +347,24 @@ class AudioPlayer {
       (event) => _sequenceStateSubject
           .add(sequenceState.copyWith(currentIndex: event.currentIndex)),
     );
-    _currentIndexSubject.addStream(
-        sequenceStateStream.map((sequenceState) => sequenceState.currentIndex));
-    _sequenceSubject.addStream(
-        sequenceStateStream.map((sequenceState) => sequenceState.sequence));
-    _shuffleIndicesSubject.addStream(sequenceStateStream
-        .map((sequenceState) => sequenceState.shuffleIndices));
-    _shuffleModeEnabledSubject.addStream(sequenceStateStream
-        .map((sequenceState) => sequenceState.shuffleModeEnabled));
-    _loopModeSubject.addStream(
-        sequenceStateStream.map((sequenceState) => sequenceState.loopMode));
+    _derivedEventPipes.add(_currentIndexSubject.addStream(sequenceStateStream
+        .map((sequenceState) => sequenceState.currentIndex)));
+    _derivedEventPipes.add(_sequenceSubject.addStream(
+        sequenceStateStream.map((sequenceState) => sequenceState.sequence)));
+    _derivedEventPipes.add(_shuffleIndicesSubject.addStream(sequenceStateStream
+        .map((sequenceState) => sequenceState.shuffleIndices)));
+    _derivedEventPipes.add(_shuffleModeEnabledSubject.addStream(
+        sequenceStateStream
+            .map((sequenceState) => sequenceState.shuffleModeEnabled)));
+    _derivedEventPipes.add(_loopModeSubject.addStream(
+        sequenceStateStream.map((sequenceState) => sequenceState.loopMode)));
 
-    _androidAudioSessionIdSubject.addStream(playbackEventStream
-        .map((event) => event.androidAudioSessionId)
-        .distinct());
+    _derivedEventPipes.add(_androidAudioSessionIdSubject.addStream(
+        playbackEventStream
+            .map((event) => event.androidAudioSessionId)
+            .distinct()));
 
-    _errorSubject.addStream(playbackEventStream
+    _derivedEventPipes.add(_errorSubject.addStream(playbackEventStream
         .map((event) => (
               code: event.errorCode,
               message: event.errorMessage,
@@ -367,11 +373,11 @@ class AudioPlayer {
         .distinct()
         .where((error) => error.code != null)
         .map((error) =>
-            PlayerException(error.code!, error.message, error.index)));
-    _playerStateSubject.addStream(playerEventStream
+            PlayerException(error.code!, error.message, error.index))));
+    _derivedEventPipes.add(_playerStateSubject.addStream(playerEventStream
         .map((event) =>
             PlayerState(event.playing, event.playbackEvent.processingState))
-        .distinct());
+        .distinct()));
     _setPlatformActive(false, force: true)
         ?.catchError((dynamic e) async => null);
     // Respond to changes to AndroidAudioAttributes configuration.
@@ -1543,6 +1549,7 @@ class AudioPlayer {
 
       await _playbackEventSubject.close();
       await _sequenceStateSubject.close();
+      await Future.wait(_derivedEventPipes);
       await _playingSubject.close();
       await _volumeSubject.close();
       await _speedSubject.close();
