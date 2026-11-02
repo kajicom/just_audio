@@ -1,3 +1,9 @@
+## 0.10.6 (Kajicom workaround)
+
+Stop and Dispose report native cleanup failures and retain the native player
+for retry. Concurrent Stop calls wait for cleanup. Legacy disposal is used only
+when the platform does not implement disposePlayer.
+
 ## 0.10.6
 
 * Support AGP 9.

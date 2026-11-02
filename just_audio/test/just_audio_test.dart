@@ -1138,6 +1138,137 @@ void runTests() {
     await player.dispose();
   });
 
+  group('native cleanup failures', () {
+    for (final operation in ['stop', 'dispose']) {
+      for (final legacy in [false, true]) {
+        test('$operation reports cleanup failure and can retry; legacy=$legacy',
+            () async {
+          final player = AudioPlayer();
+          await player.setUrl('https://bar.bar/foo.mp3');
+          final nativePlayer = mock.mostRecentPlayer!;
+          final failure = PlatformException(code: 'native_cleanup_failed');
+          addTearDown(() async {
+            mock.disposePlayerError = null;
+            nativePlayer.disposeError = null;
+            try {
+              await player.dispose();
+            } finally {
+              mock._players.remove(nativePlayer.id);
+            }
+          });
+          mock.disposePlayerError = legacy ? MissingPluginException() : failure;
+          nativePlayer.disposeError = legacy ? failure : null;
+
+          for (var attempt = 0; attempt < 2; attempt++) {
+            await expectLater(
+              operation == 'stop' ? player.stop() : player.dispose(),
+              throwsA(same(failure)),
+            );
+          }
+
+          expect(mock._players[nativePlayer.id], same(nativePlayer));
+          expect(nativePlayer.disposeCalls, legacy ? 2 : 0);
+          mock.disposePlayerError = null;
+          nativePlayer.disposeError = null;
+          if (operation == 'stop') {
+            await player.stop();
+            expect(mock._players, isNot(contains(nativePlayer.id)));
+            await player.setUrl('https://baz.baz/bar.mp3');
+            expect(player.processingState, ProcessingState.ready);
+          }
+          await player.dispose();
+          expect(mock._players, isNot(contains(nativePlayer.id)));
+          expect(nativePlayer.disposeCalls, legacy ? 3 : 1);
+        });
+      }
+    }
+
+    for (final operation in ['stop', 'dispose']) {
+      test('$operation waits for a pending Stop to release the native player',
+          () async {
+        final player = AudioPlayer();
+        await player.setUrl('https://bar.bar/foo.mp3');
+        final nativePlayer = mock.mostRecentPlayer!;
+        final disposing = Completer<void>();
+        final release = Completer<void>();
+        nativePlayer.onDispose = () async {
+          disposing.complete();
+          await release.future;
+        };
+        addTearDown(() async {
+          if (!release.isCompleted) release.complete();
+          await player.dispose();
+        });
+
+        final firstStop = player.stop();
+        await disposing.future;
+        var completed = false;
+        final nextCommand =
+            (operation == 'stop' ? player.stop() : player.dispose())
+                .then((_) => completed = true);
+        await Future<void>.delayed(Duration.zero);
+        expect(completed, false);
+        expect(mock._players[nativePlayer.id], same(nativePlayer));
+
+        release.complete();
+        await firstStop;
+        await nextCommand;
+        expect(mock._players, isNot(contains(nativePlayer.id)));
+        expect(nativePlayer.disposeCalls, 1);
+      });
+    }
+
+    test('a source change during failed cleanup still allows cleanup retry',
+        () async {
+      final player = AudioPlayer();
+      await player.setUrl('https://bar.bar/foo.mp3');
+      final nativePlayer = mock.mostRecentPlayer!;
+      final disposing = Completer<void>();
+      final release = Completer<void>();
+      final failure = PlatformException(code: 'native_cleanup_failed');
+      nativePlayer.onDispose = () async {
+        if (!disposing.isCompleted) disposing.complete();
+        await release.future;
+        throw failure;
+      };
+      addTearDown(() async {
+        if (!release.isCompleted) release.complete();
+        nativePlayer.onDispose = null;
+        await player.dispose();
+      });
+
+      final stopping = expectLater(player.stop(), throwsA(same(failure)));
+      await disposing.future;
+      final replacing =
+          player.setUrl('https://baz.baz/bar.mp3', preload: false);
+      release.complete();
+      await Future.wait([stopping, replacing]);
+      nativePlayer.onDispose = null;
+
+      await player.stop();
+      expect(mock._players, isNot(contains(nativePlayer.id)));
+      await player.dispose();
+    });
+
+    for (final missingApi in [MissingPluginException(), UnimplementedError()]) {
+      test('disposal supports the older player API after $missingApi',
+          () async {
+        final player = AudioPlayer();
+        await player.setUrl('https://bar.bar/foo.mp3');
+        final nativePlayer = mock.mostRecentPlayer!;
+        addTearDown(() {
+          mock.disposePlayerError = null;
+          mock._players.remove(nativePlayer.id);
+        });
+        mock.disposePlayerError = missingApi;
+
+        await player.dispose();
+
+        expect(nativePlayer.disposeCalls, 1);
+      });
+    }
+  });
+
   test('play-load', () async {
     for (var delayMs in [0, 50]) {
       final player = AudioPlayer();
@@ -1722,6 +1853,7 @@ class MockJustAudio extends Mock
     with MockPlatformInterfaceMixin
     implements JustAudioPlatform {
   MockAudioPlayer? mostRecentPlayer;
+  Object? disposePlayerError;
   final _players = <String, MockAudioPlayer>{};
 
   @override
@@ -1740,7 +1872,8 @@ class MockJustAudio extends Mock
   @override
   Future<DisposePlayerResponse> disposePlayer(
       DisposePlayerRequest request) async {
-    _players[request.id]!.dispose(DisposeRequest());
+    if (disposePlayerError case final error?) throw error;
+    await _players[request.id]!.dispose(DisposeRequest());
     _players.remove(request.id);
     return DisposePlayerResponse();
   }
@@ -1808,6 +1941,9 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   int? _errorCode;
   String? _errorMessage;
   Completer<void>? _loadBlock;
+  Object? disposeError;
+  Future<void> Function()? onDispose;
+  int disposeCalls = 0;
 
   MockAudioPlayer(InitRequest request)
       : audioLoadConfiguration = request.audioLoadConfiguration,
@@ -2006,6 +2142,9 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<DisposeResponse> dispose(DisposeRequest request) async {
+    disposeCalls++;
+    if (disposeError case final error?) throw error;
+    await onDispose?.call();
     await Future<dynamic>.delayed(const Duration(milliseconds: 10));
     _processingState = ProcessingStateMessage.idle;
     _errorCode = null;

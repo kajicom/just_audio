@@ -113,7 +113,6 @@ class AudioPlayer {
   StreamSubscription<void>? _errorsSubscription;
   StreamSubscription<void>? _errorsResetSubscription;
 
-  String? _id;
   final _proxy = _ProxyHttpServer();
   // ignore: deprecated_member_use_from_same_package
   final ConcatenatingAudioSource _playlist;
@@ -250,8 +249,7 @@ class AudioPlayer {
     bool useLazyPreparation = true,
     ShuffleOrder? shuffleOrder,
     int maxSkipsOnError = 0,
-  })  : _id = _generateId(),
-        _userAgent = userAgent,
+  })  : _userAgent = userAgent,
         _androidApplyAudioAttributes =
             androidApplyAudioAttributes && _isAndroid(),
         _handleAudioSessionActivation = handleAudioSessionActivation,
@@ -1163,10 +1161,12 @@ class AudioPlayer {
   /// want to resume playback later. Use [dispose] when the app is completely
   /// finished playing audio. Use [pause] instead if you would like to keep the
   /// decoders alive so that the app can quickly resume audio playback.
+  ///
+  /// Native cleanup failures complete the returned future with an error.
+  /// Another [stop] or [dispose] call can retry releasing the native player.
   Future<void> stop() async {
     if (_disposed) return;
-    final future =
-        _setPlatformActive(false)?.catchError((dynamic e) async => null);
+    final future = _setPlatformActive(false);
 
     _playInterrupted = false;
     // Update local state immediately so that queries aren't surprised.
@@ -1405,6 +1405,9 @@ class AudioPlayer {
 
   /// Releases all resources associated with this player. You must invoke this
   /// after you are done with the player.
+  ///
+  /// Native stopping failures complete the returned future with an error.
+  /// The native handle is retained so another call can retry cleanup.
   Future<void> dispose() {
     return _lock.synchronized(() async {
       if (_disposed) return;
@@ -1473,7 +1476,10 @@ class AudioPlayer {
   Future<Duration?>? _setPlatformActive(bool active,
       {Completer<void>? playCompleter, bool force = false}) {
     if (_disposed) return null;
-    if (!force && (active == _active)) return _loadFuture;
+    if (!force && active == _active) {
+      // Repeated Stop calls wait for native cleanup, not the last media load.
+      return active ? _loadFuture : _platform.then((_) => null);
+    }
     _platformLoading = active;
 
     // Warning! Tricky async code lies ahead.
@@ -1627,14 +1633,25 @@ class AudioPlayer {
 
         if (!force) {
           if (oldPlatform != null && oldPlatform is! _IdleAudioPlayer) {
-            await _disposePlatform(oldPlatform);
+            try {
+              await _disposePlatform(oldPlatform);
+            } catch (_) {
+              // Keep the native player reachable after cleanup fails. When
+              // this transition is still current, restore the native platform
+              // so another Stop or Dispose can retry releasing the player.
+              if (_activationCount == activationNumber && !_disposed) {
+                _active = true;
+                _platform = Future.value(oldPlatform);
+              }
+              rethrow;
+            }
           }
         }
         // During initialisation, we must only use this platform reference in case
         // _platform is updated again during initialisation.
         final platform = active && !_disposed
             ? await (_nativePlatform = _pluginPlatform.init(InitRequest(
-                id: _id = _generateId(),
+                id: _generateId(),
                 audioLoadConfiguration: _audioLoadConfiguration?._toMessage(),
                 androidAudioEffects: (_isAndroid() || _isUnitTest())
                     ? _audioPipeline.androidAudioEffects
@@ -1653,7 +1670,7 @@ class AudioPlayer {
                 useLazyPreparation: _playlist.useLazyPreparation,
               )))
             : (_idlePlatform = _IdleAudioPlayer(
-                id: _id = _generateId(),
+                id: _generateId(),
                 sequenceStream: sequenceStream,
                 errorCode: playbackEvent.errorCode,
                 errorMessage: playbackEvent.errorMessage,
@@ -1774,15 +1791,20 @@ class AudioPlayer {
     if (platform is _IdleAudioPlayer) {
       await platform.dispose(DisposeRequest());
     } else {
-      _nativePlatform = null;
       try {
-        await _pluginPlatform.disposePlayer(DisposePlayerRequest(id: _id!));
-      } catch (e) {
-        // Fallback if disposePlayer hasn't been implemented.
+        await _pluginPlatform
+            .disposePlayer(DisposePlayerRequest(id: platform.id));
+      } catch (error) {
+        // Platforms without disposePlayer use the older player-channel method.
+        // A native cleanup failure reaches the caller without being replaced
+        // by an error from that unsupported fallback.
+        if (error is! MissingPluginException && error is! UnimplementedError) {
+          rethrow;
+        }
         await platform.dispose(DisposeRequest());
-      } finally {
-        _id = null;
       }
+      // A failed cleanup retains the native handle and ID for another attempt.
+      _nativePlatform = null;
     }
   }
 
