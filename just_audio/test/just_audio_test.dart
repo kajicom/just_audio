@@ -1366,6 +1366,60 @@ void runTests() {
     await playing;
   });
 
+  for (final playBeforeSource in [false, true]) {
+    test(
+        'replacing the initial load preserves Play; '
+        'playBeforeSource=$playBeforeSource', () async {
+      final player = AudioPlayer(handleAudioSessionActivation: false);
+      final enteredLoad = Completer<void>();
+      MockAudioPlayer? firstNative;
+      mock.onInit = (native) async {
+        mock.onInit = null;
+        firstNative = native;
+        native.blockLoad();
+        native.onLoad = (_) async {
+          if (!enteredLoad.isCompleted) enteredLoad.complete();
+        };
+      };
+      addTearDown(() async {
+        mock.onInit = null;
+        firstNative?.unblockLoad();
+        await player.dispose();
+      });
+      if (!playBeforeSource) {
+        await player.setUrl('https://bar.bar/first.mp3', preload: false);
+      }
+      var playCompleted = false;
+      final playing = player.play().then<void>((_) => playCompleted = true);
+      final firstLoad = playBeforeSource
+          ? expectLater(player.setUrl('https://bar.bar/first.mp3'),
+              throwsA(isA<PlayerInterruptedException>()))
+          : Future<void>.value();
+      await enteredLoad.future;
+      final replacement = player.setUrl('https://bar.bar/second.mp3');
+      firstNative!.unblockLoad();
+      await Future.wait([firstLoad, replacement]);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(mock.mostRecentPlayer, same(firstNative));
+      expect(player.processingState, ProcessingState.ready);
+      expect(player.playing, true);
+      expect(firstNative!._playing, true);
+      expect(firstNative!.playCalls, 1);
+      expect(playCompleted, false);
+      await player.pause();
+      await playing;
+    });
+  }
+
+  test('an initial source failure reaches Play', () async {
+    final player = AudioPlayer(handleAudioSessionActivation: false);
+    addTearDown(player.dispose);
+    await player.setUrl('https://bar.bar/error.mp3', preload: false);
+    await expectLater(player.play(), throwsA(isA<PlayerException>()));
+    expect(player.playing, false);
+  });
+
   test('Pause cancels Play before native initialization replies', () async {
     final player = AudioPlayer(handleAudioSessionActivation: false);
     final initializing = Completer<void>();
@@ -2296,6 +2350,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   Object? disposeError;
   Future<void> Function()? onDispose;
   Future<void> Function()? onPause;
+  Future<void> Function(LoadRequest)? onLoad;
   int disposeCalls = 0;
   int playCalls = 0;
 
@@ -2345,6 +2400,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
 
   @override
   Future<LoadResponse> load(LoadRequest request) async {
+    await onLoad?.call(request);
     _loadRequest?.interrupted = true;
     final loadRequest = _loadRequest = MockLoadRequest();
     final playlist =
@@ -2410,6 +2466,7 @@ class MockAudioPlayer extends AudioPlayerPlatform {
   }
 
   void _startTimer() {
+    _playTimer?.cancel();
     _playTimer = Timer(_remaining, () {
       _setPosition(_position);
       _processingState = ProcessingStateMessage.completed;

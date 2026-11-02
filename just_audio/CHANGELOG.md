@@ -10,6 +10,8 @@ Play reports startup failures and completes when Pause, Stop or Dispose cancels
 startup. Loading and Play share one native Play operation. Dispose disables
 commands immediately, shares concurrent cleanup and permits retry after failure.
 Disposal waits for event forwarding before closing derived state streams.
+Replacing a file during initial media loading preserves Play and the native
+player. Superseded loading calls stop before issuing another native load.
 
 ## 0.10.6
 

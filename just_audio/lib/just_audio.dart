@@ -78,13 +78,13 @@ class AudioPlayer {
 
   /// This is `true` when the audio player needs to engage the native platform
   /// side of the plugin to decode or play audio, and is `false` while idle or
-  /// after a failed transition. A native player retained after cleanup failure
-  /// is available only for another cleanup attempt, not playback.
+  /// after native setup or cleanup fails. A native player retained after cleanup
+  /// failure is available only for another cleanup attempt, not playback.
   bool _active = false;
 
   /// The result of the latest platform transition. Commands await this future
-  /// for a configured native player or an idle implementation. A failed
-  /// transition leaves an error here until another transition succeeds.
+  /// for a configured native player or an idle implementation. Failed native
+  /// setup or cleanup leaves an error here until another transition succeeds.
   late Future<AudioPlayerPlatform> _platform;
 
   /// Reflects the current platform immediately after it is set.
@@ -940,8 +940,12 @@ class AudioPlayer {
     final pluginLoadRequest = _pluginLoadRequest;
     if (_playlist.children.isEmpty) return null;
     if (_active) {
+      final platform = await _platform;
+      // Native initialization can outlast a source replacement. The request
+      // check rejects the old source before its load() reloads the new file.
+      pluginLoadRequest?.checkInterruption();
       return await _load(
-        await _platform,
+        platform,
         _playlist,
         initialSeekValues: pluginLoadRequest?.initialSeekValues,
       );
@@ -1140,11 +1144,13 @@ class AudioPlayer {
       // Play without a source waits for setAudioSources to load one. The source
       // transition uses this accepted request when starting native playback.
       if (_playlist.children.isEmpty) return;
-      if (_active) {
-        await _sendPlayRequest(await _platform, request);
-      } else {
-        await _setPlatformActive(true, playRequest: request);
+      if (!_active) {
+        unawaited(_setPlatformActive(true, playRequest: request));
       }
+      // Play depends on the native player, not the duration result of the file
+      // that triggered initialization. Replacing that file cancels its load
+      // while the accepted Play continues with the replacement.
+      await _sendPlayRequest(await _platform, request);
     } catch (error, stack) {
       _finishPlay(request, error: error, stack: stack);
     }
@@ -1860,32 +1866,47 @@ class AudioPlayer {
           initialSeekValues: initialSeekValues,
         );
         durationCompleter.complete(duration);
-      } on PlayerInterruptedException catch (error, stack) {
-        if (active) {
-          durationCompleter.completeError(error, stack);
-        } else {
+      } catch (error, stack) {
+        if (!active && error is PlayerInterruptedException) {
           durationCompleter.complete(null);
+        } else {
+          // An uncancelled initial file-load failure reaches its caller and Play.
+          // A newer source owns its own load; cancelling the superseded load
+          // must not finish the Play that continues with the replacement.
+          if (active && !wasInterrupted()) {
+            _finishPlay(playRequest ?? _playRequest,
+                error: error, stack: stack);
+          }
+          durationCompleter.completeError(error, stack);
         }
-      } catch (e, stackTrace) {
-        durationCompleter.completeError(e, stackTrace);
       }
 
       return platform;
     }
 
-    _platform = setPlatform();
-    final change = _platform.then((_) => durationCompleter.future);
-    _platformTransition = change;
-    change.then<void>((_) {
-      if (identical(_platformTransition, change)) _platformTransition = null;
-    }, onError: (Object error, StackTrace stack) {
-      if (identical(_platformTransition, change)) {
-        _platformTransition = null;
+    final platformReady = _platform = setPlatform();
+    final transition = platformReady.then((_) => durationCompleter.future,
+        onError: (Object error, StackTrace stack) {
+      // Initialization, configuration and native cleanup failures invalidate the
+      // platform. A replaced file's loading error belongs to durationCompleter
+      // and leaves the initialized native player available for the new file.
+      if (identical(_platform, platformReady)) {
         _active = false;
         _platformLoading = false;
       }
+      Error.throwWithStackTrace(error, stack);
     });
-    return change;
+    _platformTransition = transition;
+    transition.then<void>((_) {
+      if (identical(_platformTransition, transition)) {
+        _platformTransition = null;
+      }
+    }, onError: (Object error, StackTrace stack) {
+      if (identical(_platformTransition, transition)) {
+        _platformTransition = null;
+      }
+    });
+    return transition;
   }
 
   // Cancels native event streams while their method-channel handlers still
