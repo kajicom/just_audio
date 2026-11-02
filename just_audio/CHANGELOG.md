@@ -1,19 +1,13 @@
 ## 0.10.6 (Kajicom workaround)
 
-Stop and Dispose report native cleanup errors and retain the native creation
-ID until release succeeds, including when initialization fails. Concurrent
-commands await pending cleanup; recovery releases the failed native player
-before initializing playback again. Legacy disposal is used only when the
-platform does not implement disposePlayer.
+Stop and Dispose report native cleanup failures. Native creation IDs remain
+available for Dispose after a failed Stop or initialization. Legacy disposal
+is used only when the platform does not implement disposePlayer.
 
-Play reports startup failures and completes when Pause, Stop or Dispose cancels
-startup. Loading and Play share one native Play operation. Dispose disables
-commands immediately, shares concurrent cleanup and permits retry after failure.
-Disposal waits for event forwarding before closing derived state streams.
-Replacing a file during initial media loading preserves Play and the native
-player. Superseded loading calls stop before issuing another native load.
-Cancelling Play during loading waits for native stopping, and native setup
-failure also reaches a Play accepted before a source was assigned.
+Dispose ends the player's lifetime with one shared result. Native event
+subscriptions are cancelled before native release, and Dart resources are
+closed even when native release fails. State forwarding finishes before its
+destination streams close.
 
 ## 0.10.6
 
