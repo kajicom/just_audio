@@ -73,20 +73,37 @@ class AudioPlayer {
   final AndroidAudioOffloadPreferences? _androidAudioOffloadPreferences;
 
   /// This is `true` when the audio player needs to engage the native platform
-  /// side of the plugin to decode or play audio, and is `false` when the native
-  /// resources are not needed (i.e. after initial instantiation and after [stop]).
+  /// side of the plugin to decode or play audio, and is `false` while idle or
+  /// after a failed transition. A native player retained after cleanup failure
+  /// is available only for another cleanup attempt, not playback.
   bool _active = false;
 
-  /// This is set to [_nativePlatform] when [_active] is `true` and
-  /// [_idlePlatform] otherwise.
+  /// The result of the latest platform transition. Commands await this future
+  /// for a configured native player or an idle implementation. A failed
+  /// transition leaves an error here until another transition succeeds.
   late Future<AudioPlayerPlatform> _platform;
 
   /// Reflects the current platform immediately after it is set.
   AudioPlayerPlatform? _platformValue;
 
-  /// The interface to the native portion of the plugin. This will be disposed
-  /// and set to `null` when not in use.
-  Future<AudioPlayerPlatform>? _nativePlatform;
+  /// The native player's ID and initialization result. Initialization may fail
+  /// after acquiring native resources, so cleanup retains the ID until release
+  /// succeeds. The initialization result supplies the legacy disposal API.
+  ({String id, Future<AudioPlayerPlatform> ready})? _nativePlayer;
+
+  // Concurrent requests for the same platform mode share this transition.
+  // Clearing a failed attempt permits another attempt to release the retained
+  // native player before creating its replacement.
+  Future<Duration?>? _platformTransition;
+
+  // An accepted Play can wait for a source or native access before sending
+  // playback. Pause, Stop and Dispose withdraw this request; its completion
+  // remains associated with that Play when a newer request is accepted.
+  _PlayRequest? _playRequest;
+
+  // A successful disposal result is retained. A failed attempt clears this
+  // future so Dispose can retry cleanup while playback commands stay disabled.
+  Future<void>? _disposing;
 
   /// A pure Dart implementation of the platform interface for use when the
   /// native platform is not needed.
@@ -117,6 +134,9 @@ class AudioPlayer {
   // ignore: deprecated_member_use_from_same_package
   final ConcatenatingAudioSource _playlist;
   final Map<String, AudioSource> _audioSources = {};
+  // Commands are disabled when Dispose begins. _disposing reports whether
+  // native and Dart cleanup has actually finished and allows failed cleanup
+  // to be retried without accepting new playback commands.
   bool _disposed = false;
   _PluginLoadRequest? _pluginLoadRequest;
   final AudioPipeline _audioPipeline;
@@ -1064,8 +1084,12 @@ class AudioPlayer {
   /// as an audio source is loaded and ready to play. If an audio source has
   /// been set but not preloaded, this method will also initiate the loading.
   /// The [Future] returned by this method completes when the playback completes
-  /// or is paused or stopped. If the player is already playing, this method
-  /// completes immediately.
+  /// or is paused or stopped. Pause, Stop and Dispose also complete a Play
+  /// that is still waiting for a source or native access. If the player is
+  /// already playing, this method completes immediately.
+  ///
+  /// Failures while starting or playing audio complete the returned future
+  /// with an error and clear [playing].
   ///
   /// This method causes [playing] to become true, and it will remain true
   /// until [pause] or [stop] is called. This means that if playback completes,
@@ -1076,14 +1100,14 @@ class AudioPlayer {
   /// [processingStateStream].
   ///
   /// This method activates the audio session before playback, and will do
-  /// nothing if activation of the audio session fails for any reason.
-  Future<void> play() async {
-    if (_disposed) return;
-    if (playing) return;
+  /// nothing if audio session activation is denied. A denial clears [playing]
+  /// and completes the returned future without starting native playback.
+  Future<void> play() {
+    if (_disposed || playing) return Future.value();
+    final request = _playRequest = _PlayRequest();
     _playInterrupted = false;
-    // Broadcast to clients immediately, but revert to false if we fail to
-    // activate the audio session. This allows setAudioSource to be aware of a
-    // prior play request.
+    // Play is accepted before notifying listeners or waiting for native access.
+    // Pause and Dispose can therefore cancel startup from a listener too.
     _playerEventSubject.add(PlayerEvent(
       playing: true,
       playbackEvent: playbackEvent.copyWith(
@@ -1091,38 +1115,57 @@ class AudioPlayer {
         updateTime: DateTime.now(),
       ),
     ));
-    final playCompleter = Completer<dynamic>();
-    final audioSession = await AudioSession.instance;
-    if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {
-      if (!playing) return;
-      // TODO: rewrite this to more cleanly handle simultaneous load/play
-      // requests which each may result in platform play requests.
-      final requireActive = _playlist.children.isNotEmpty;
-      if (requireActive) {
-        if (_active) {
-          // If the native platform is already active, send it a play request.
-          // NOTE: If a load() request happens simultaneously, this may result
-          // in two play requests being sent. The platform implementation should
-          // ignore the second play request since it is already playing.
-          _sendPlayRequest(await _platform, playCompleter);
-        } else {
-          // If the native platform wasn't already active, activating it will
-          // implicitly restore the playing state and send a play request.
-          _setPlatformActive(true, playCompleter: playCompleter)
-              ?.catchError((dynamic e) async => null);
-        }
+    unawaited(_startPlay(request));
+    return request.completion.future;
+  }
+
+  Future<void> _startPlay(_PlayRequest request) async {
+    try {
+      final audioSession = await AudioSession.instance;
+      if (!identical(_playRequest, request)) return;
+      final allowed =
+          !_handleAudioSessionActivation || await audioSession.setActive(true);
+      if (!identical(_playRequest, request)) return;
+      if (!allowed) {
+        _playerEventSubject.add(playerEvent.copyWith(playing: false));
+        _finishPlay(request);
+        return;
       }
-    } else {
-      // Revert if we fail to activate the audio session.
-      _playerEventSubject.add(playerEvent.copyWith(playing: false));
+      // Play without a source waits for setAudioSources to load one. The source
+      // transition uses this accepted request when starting native playback.
+      if (_playlist.children.isEmpty) return;
+      if (_active) {
+        await _sendPlayRequest(await _platform, request);
+      } else {
+        await _setPlatformActive(true, playRequest: request);
+      }
+    } catch (error, stack) {
+      _finishPlay(request, error: error, stack: stack);
     }
-    await playCompleter.future;
+  }
+
+  // Completes one accepted Play. A reply from an older request cannot clear a
+  // newer request or change its playing state.
+  void _finishPlay(_PlayRequest? request, {Object? error, StackTrace? stack}) {
+    if (request == null || request.completion.isCompleted) return;
+    if (identical(_playRequest, request)) {
+      _playRequest = null;
+      if (error != null && !_disposed) {
+        _playerEventSubject.add(playerEvent.copyWith(playing: false));
+      }
+    }
+    if (error == null) {
+      request.completion.complete();
+    } else {
+      request.completion.completeError(error, stack);
+    }
   }
 
   /// Pauses the currently playing media. This method does nothing if
   /// ![playing].
   Future<void> pause() async {
     if (_disposed) return;
+    final request = _withdrawPlay();
     if (!playing) return;
     final stopwatch = Stopwatch();
     stopwatch.start();
@@ -1135,21 +1178,48 @@ class AudioPlayer {
         updateTime: DateTime.now(),
       ),
     ));
-    // Allow propagation to secondary streams.
-    await playingStream.firstWhere((p) => p == playing);
-    // TODO: perhaps modify platform side to ensure new state is broadcast
-    // before this method returns.
-    await (await _platform).pause(PauseRequest());
+    try {
+      // Allow propagation to secondary streams.
+      await playingStream.firstWhere((p) => p == playing);
+      // TODO: perhaps modify platform side to ensure new state is broadcast
+      // before this method returns.
+      await (await _platform).pause(PauseRequest());
+      _finishPlay(request);
+    } catch (error, stack) {
+      _finishPlay(request, error: error, stack: stack);
+      rethrow;
+    }
   }
 
+  // Withdraws Play before publishing Pause, Stop or Dispose. Startup can no
+  // longer send this request to the platform. A request that has started native
+  // playback keeps its completion pending until the native command finishes or
+  // the cancelling command reports its result.
+  _PlayRequest? _withdrawPlay() {
+    final request = _playRequest;
+    _playRequest = null;
+    if (request?.nativePlay == null) _finishPlay(request);
+    return request;
+  }
+
+  // Loading and Play can both reach this method while a source is starting.
+  // One accepted request sends native Play once; both callers await that reply.
   Future<void> _sendPlayRequest(
-      AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
+      AudioPlayerPlatform platform, _PlayRequest? playRequest) async {
+    final request = playRequest ?? _playRequest;
+    if (!playing || (request != null && !identical(_playRequest, request))) {
+      _finishPlay(request);
+      return;
+    }
     try {
-      if (!playing) return; // defensive
-      await platform.play(PlayRequest());
-      playCompleter?.complete();
-    } catch (e, stackTrace) {
-      playCompleter?.completeError(e, stackTrace);
+      if (request == null) {
+        await platform.play(PlayRequest());
+      } else {
+        await (request.nativePlay ??= platform.play(PlayRequest()));
+      }
+      _finishPlay(request);
+    } catch (error, stack) {
+      _finishPlay(request, error: error, stack: stack);
     }
   }
 
@@ -1163,15 +1233,24 @@ class AudioPlayer {
   /// decoders alive so that the app can quickly resume audio playback.
   ///
   /// Native cleanup failures complete the returned future with an error.
-  /// Another [stop] or [dispose] call can retry releasing the native player.
+  /// Another [stop], [play], [load] or [dispose] call can retry releasing the
+  /// native player. Play and Load create a fresh native player after releasing
+  /// the failed instance, retaining the selected source and playback position.
   Future<void> stop() async {
     if (_disposed) return;
+    final request = _withdrawPlay();
     final future = _setPlatformActive(false);
 
     _playInterrupted = false;
     // Update local state immediately so that queries aren't surprised.
     _playerEventSubject.add(playerEvent.copyWith(playing: false));
-    await future;
+    try {
+      await future;
+      _finishPlay(request);
+    } catch (error, stack) {
+      _finishPlay(request, error: error, stack: stack);
+      rethrow;
+    }
   }
 
   /// Sets the volume of this player, where 1.0 is normal volume.
@@ -1406,19 +1485,42 @@ class AudioPlayer {
   /// Releases all resources associated with this player. You must invoke this
   /// after you are done with the player.
   ///
-  /// Native stopping failures complete the returned future with an error.
-  /// The native handle is retained so another call can retry cleanup.
+  /// Playback commands are disabled as soon as disposal begins. The returned
+  /// future completes after native resources and Dart subscriptions and streams
+  /// are released. Concurrent calls share that cleanup attempt.
+  ///
+  /// Cleanup failures complete the returned future with an error and retain
+  /// the resources still requiring release. Another call retries cleanup.
   Future<void> dispose() {
-    return _lock.synchronized(() async {
-      if (_disposed) return;
-      await stop();
+    if (_disposing case final disposing?) return disposing;
+    final result = Completer<void>();
+    _disposing = result.future;
+    _PlayRequest? request;
+    if (!_disposed) {
       _disposed = true;
-      if (_nativePlatform != null) {
-        await _disposePlatform(await _nativePlatform!);
-        _nativePlatform = null;
-      }
+      _active = false;
+      _activationCount++;
+      request = _withdrawPlay();
+      _playInterrupted = false;
+      _playerEventSubject.add(playerEvent.copyWith(playing: false));
+    }
+    unawaited(_disposeResources().then((_) {
+      _finishPlay(request);
+      result.complete();
+    }, onError: (Object error, StackTrace stack) {
+      _disposing = null;
+      _finishPlay(request, error: error, stack: stack);
+      result.completeError(error, stack);
+    }));
+    return result.future;
+  }
+
+  Future<void> _disposeResources() {
+    return _lock.synchronized(() async {
+      await _cancelPlatformSubscriptions();
+      await _disposeNativePlatform();
       if (_idlePlatform != null) {
-        await _disposePlatform(_idlePlatform!);
+        await _idlePlatform!.dispose(DisposeRequest());
         _idlePlatform = null;
       }
       _playlist.children.clear();
@@ -1427,8 +1529,6 @@ class AudioPlayer {
       }
       _audioSources.clear();
       _proxy.stop();
-      await _playerDataSubscription?.cancel();
-      await _playbackEventSubscription?.cancel();
       await _androidAudioAttributesSubscription?.cancel();
       await _becomingNoisyEventSubscription?.cancel();
       await _interruptionEventSubscription?.cancel();
@@ -1462,7 +1562,6 @@ class AudioPlayer {
       await _currentIndexSubject.close();
       await _loopModeSubject.close();
       await _shuffleModeEnabledSubject.close();
-      await _shuffleModeEnabledSubject.close();
     });
   }
 
@@ -1471,14 +1570,18 @@ class AudioPlayer {
   /// the returned future completes with its duration if known, or `null`
   /// otherwise.
   ///
-  /// The platform will not switch if [active] == [_active] unless [force] is
-  /// `true`.
+  /// Concurrent requests for the same mode await the pending transition.
+  /// Once a transition finishes, the platform stays in that mode unless [force]
+  /// is true or failed native cleanup still needs to be retried.
   Future<Duration?>? _setPlatformActive(bool active,
-      {Completer<void>? playCompleter, bool force = false}) {
+      {_PlayRequest? playRequest, bool force = false}) {
     if (_disposed) return null;
     if (!force && active == _active) {
-      // Repeated Stop calls wait for native cleanup, not the last media load.
-      return active ? _loadFuture : _platform.then((_) => null);
+      if (_platformTransition case final pending?) return pending;
+      if (active) return _loadFuture;
+      if (_nativePlayer == null) return Future.value(null);
+      // Failed cleanup retains a native player. Stop retries cleanup even
+      // though no active platform was established by the failed transition.
     }
     _platformLoading = active;
 
@@ -1514,9 +1617,9 @@ class AudioPlayer {
     bool checkInterruption() {
       // No interruption.
       if (!wasInterrupted()) return false;
-      pluginLoadRequest?.checkInterruption();
-      // An interruption that we can ignore
+      // Replacing media cannot turn successful native cleanup into a failure.
       if (!active) return true;
+      pluginLoadRequest?.checkInterruption();
       // An interruption that should throw
       throw PlayerInterruptedException('Loading interrupted');
     }
@@ -1606,7 +1709,7 @@ class AudioPlayer {
     }
 
     Future<AudioPlayerPlatform> setPlatform() async {
-      // We need to cancel before calling _disposePlatform in order to prevent a
+      // We need to cancel before releasing the native player to prevent a
       // MissingPluginException. This also means there will potentially be
       // unconsumed events which will unfortunately appear when spinning up a
       // new platform player. For now, we change the player ID to avoid wires
@@ -1619,38 +1722,13 @@ class AudioPlayer {
       }
 
       final platform = await _lock.synchronized(() async {
-        final oldPlatform = _platformValue;
-        // Strangely, this throws "Cannot complete a future with itself" when
-        // _playbackEventSubscription==null under flutter test.
-        // await _playbackEventSubscription?.cancel();
-        // await _playerDataSubscription?.cancel();
-        if (_playbackEventSubscription != null) {
-          await _playbackEventSubscription!.cancel();
-        }
-        if (_playerDataSubscription != null) {
-          await _playerDataSubscription!.cancel();
-        }
+        await _cancelPlatformSubscriptions();
 
-        if (!force) {
-          if (oldPlatform != null && oldPlatform is! _IdleAudioPlayer) {
-            try {
-              await _disposePlatform(oldPlatform);
-            } catch (_) {
-              // Keep the native player reachable after cleanup fails. When
-              // this transition is still current, restore the native platform
-              // so another Stop or Dispose can retry releasing the player.
-              if (_activationCount == activationNumber && !_disposed) {
-                _active = true;
-                _platform = Future.value(oldPlatform);
-              }
-              rethrow;
-            }
-          }
-        }
+        if (!force) await _disposeNativePlatform();
         // During initialisation, we must only use this platform reference in case
         // _platform is updated again during initialisation.
         final platform = active && !_disposed
-            ? await (_nativePlatform = _pluginPlatform.init(InitRequest(
+            ? await _createNativePlatform(InitRequest(
                 id: _generateId(),
                 audioLoadConfiguration: _audioLoadConfiguration?._toMessage(),
                 androidAudioEffects: (_isAndroid() || _isUnitTest())
@@ -1668,7 +1746,7 @@ class AudioPlayer {
                 androidAudioOffloadPreferences:
                     _androidAudioOffloadPreferences?._toMessage(),
                 useLazyPreparation: _playlist.useLazyPreparation,
-              )))
+              ))
             : (_idlePlatform = _IdleAudioPlayer(
                 id: _generateId(),
                 sequenceStream: sequenceStream,
@@ -1760,7 +1838,7 @@ class AudioPlayer {
           if (checkInterruption()) return inactiveResult(platform);
         }
         if (playing) {
-          _sendPlayRequest(platform, playCompleter);
+          _sendPlayRequest(platform, playRequest);
         }
       }
 
@@ -1775,6 +1853,12 @@ class AudioPlayer {
           initialSeekValues: initialSeekValues,
         );
         durationCompleter.complete(duration);
+      } on PlayerInterruptedException catch (error, stack) {
+        if (active) {
+          durationCompleter.completeError(error, stack);
+        } else {
+          durationCompleter.complete(null);
+        }
       } catch (e, stackTrace) {
         durationCompleter.completeError(e, stackTrace);
       }
@@ -1783,29 +1867,62 @@ class AudioPlayer {
     }
 
     _platform = setPlatform();
-    return _platform.then((_) => durationCompleter.future);
+    final change = _platform.then((_) => durationCompleter.future);
+    _platformTransition = change;
+    change.then<void>((_) {
+      if (identical(_platformTransition, change)) _platformTransition = null;
+    }, onError: (Object error, StackTrace stack) {
+      if (identical(_platformTransition, change)) {
+        _platformTransition = null;
+        _active = false;
+        _platformLoading = false;
+      }
+    });
+    return change;
   }
 
-  /// Disposes of the given platform.
-  Future<void> _disposePlatform(AudioPlayerPlatform platform) async {
-    if (platform is _IdleAudioPlayer) {
-      await platform.dispose(DisposeRequest());
-    } else {
-      try {
-        await _pluginPlatform
-            .disposePlayer(DisposePlayerRequest(id: platform.id));
-      } catch (error) {
-        // Platforms without disposePlayer use the older player-channel method.
-        // A native cleanup failure reaches the caller without being replaced
-        // by an error from that unsupported fallback.
-        if (error is! MissingPluginException && error is! UnimplementedError) {
-          rethrow;
-        }
-        await platform.dispose(DisposeRequest());
-      }
-      // A failed cleanup retains the native handle and ID for another attempt.
-      _nativePlatform = null;
+  // Cancels native event streams while their method-channel handlers still
+  // exist. Stop and Dispose share this ordering before releasing native audio.
+  Future<void> _cancelPlatformSubscriptions() async {
+    // Strangely, awaiting a null cancellation throws "Cannot complete a future
+    // with itself" under flutter test, so existing subscriptions are checked.
+    if (_playbackEventSubscription != null) {
+      await _playbackEventSubscription!.cancel();
+      _playbackEventSubscription = null;
     }
+    if (_playerDataSubscription != null) {
+      await _playerDataSubscription!.cancel();
+      _playerDataSubscription = null;
+    }
+  }
+
+  // Saves the ID before initialization can fail. Both native creation and
+  // disposal run under _lock, so cleanup waits for the creation reply and can
+  // release its ID even when no AudioPlayerPlatform was returned.
+  Future<AudioPlayerPlatform> _createNativePlatform(InitRequest request) {
+    final ready =
+        Future<AudioPlayerPlatform>.sync(() => _pluginPlatform.init(request));
+    _nativePlayer = (id: request.id, ready: ready);
+    return ready;
+  }
+
+  // Releases the retained native player. Only a successful reply clears the
+  // creation attempt; failed cleanup remains available for another attempt.
+  Future<void> _disposeNativePlatform() async {
+    final native = _nativePlayer;
+    if (native == null) return;
+    try {
+      await _pluginPlatform.disposePlayer(DisposePlayerRequest(id: native.id));
+    } catch (error) {
+      // Platforms without disposePlayer use the older player-channel method.
+      // A genuine cleanup error reaches the caller without being replaced by
+      // an error from an unsupported fallback.
+      if (error is! MissingPluginException && error is! UnimplementedError) {
+        rethrow;
+      }
+      await (await native.ready).dispose(DisposeRequest());
+    }
+    _nativePlayer = null;
   }
 
   /// Clears the plugin's internal asset cache directory. Call this when the
@@ -1870,6 +1987,15 @@ class PlayerInterruptedException implements Exception {
 
   @override
   String toString() => "$message";
+}
+
+// One accepted Play owns its public completion and the native Play operation.
+// Startup and play() can both ask to send playback; retaining nativePlay makes
+// those callers share one command instead of treating a duplicate native Play
+// reply as the end of the recording.
+class _PlayRequest {
+  final completion = Completer<void>();
+  Future<PlayResponse>? nativePlay;
 }
 
 /// Encapsulates the playback event and the playing state of the player.

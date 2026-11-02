@@ -1,8 +1,14 @@
 ## 0.10.6 (Kajicom workaround)
 
-Stop and Dispose report native cleanup failures and retain the native player
-for retry. Concurrent Stop calls wait for cleanup. Legacy disposal is used only
-when the platform does not implement disposePlayer.
+Stop and Dispose report native cleanup errors and retain the native creation
+ID until release succeeds, including when initialization fails. Concurrent
+commands await pending cleanup; recovery releases the failed native player
+before initializing playback again. Legacy disposal is used only when the
+platform does not implement disposePlayer.
+
+Play reports startup failures and completes when Pause, Stop or Dispose cancels
+startup. Loading and Play share one native Play operation. Dispose disables
+commands immediately, shares concurrent cleanup and permits retry after failure.
 
 ## 0.10.6
 
