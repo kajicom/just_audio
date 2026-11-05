@@ -7,11 +7,13 @@ import 'dart:math';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_platform_interface/just_audio_platform_interface.dart';
 import 'package:mockito/mockito.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -110,7 +112,31 @@ void runTests() {
         AudioSource.asset('audio/foo.mp3', package: 'bar', tag: 'asset-tag'),
         preload: false);
     expectAsset('asset:///packages/bar/audio/foo.mp3', tag: 'asset-tag');
+    await player.dispose();
   });
+
+  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    test('bundled loading on $platform requires no temporary files', () async {
+      final originalPaths = PathProviderPlatform.instance;
+      debugDefaultTargetPlatformOverride = platform;
+      PathProviderPlatform.instance = _NoTemporaryStorage();
+      final player = AudioPlayer(handleAudioSessionActivation: false);
+      try {
+        await player.setAsset('audio/a bell.wav', package: 'bells');
+        final source =
+            mock.mostRecentPlayer!._audioSource as UriAudioSourceMessage;
+        expect(source.uri, 'asset:///packages/bells/audio/a%20bell.wav');
+        await player.setFilePath('/existing/exercise.wav');
+        final file =
+            mock.mostRecentPlayer!._audioSource as UriAudioSourceMessage;
+        expect(file.uri, 'file:///existing/exercise.wav');
+      } finally {
+        await player.dispose();
+        PathProviderPlatform.instance = originalPaths;
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+  }
 
   test('idle-state', () async {
     final player = AudioPlayer();
@@ -1842,6 +1868,12 @@ void runTests() {
     expect(player.shuffleModeEnabled, equals(true));
     await player.dispose();
   });
+}
+
+class _NoTemporaryStorage extends PathProviderPlatform {
+  @override
+  Future<String> getTemporaryPath() =>
+      Future.error(const FileSystemException('No space left on device'));
 }
 
 class MockJustAudio extends Mock

@@ -2782,7 +2782,13 @@ abstract class UriAudioSource extends IndexedAudioSource {
   Future<void> _onLoad() async {
     await super._onLoad();
     if (uri.scheme == 'asset') {
-      _overrideUri = await _loadAsset(uri.pathSegments.join('/'));
+      // Android and iOS resolve Flutter assets in the installed bundle. Passing
+      // the asset URI avoids requiring temporary storage before local playback.
+      if (kIsWeb ||
+          (defaultTargetPlatform != TargetPlatform.android &&
+              defaultTargetPlatform != TargetPlatform.iOS)) {
+        _overrideUri = await _loadAsset(uri.pathSegments.join('/'));
+      }
     } else if (uri.scheme != 'file' &&
         !kIsWeb &&
         _player!._useProxyForRequestHeaders &&

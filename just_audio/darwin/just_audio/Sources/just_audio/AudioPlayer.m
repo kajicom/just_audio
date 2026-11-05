@@ -468,14 +468,27 @@
     return array;
 }
 
+// Flutter resolves the logical key inside the installed app's resources.
+// AVPlayer opens that file directly, so bundled audio needs no disk cache.
+- (NSString *)resolveUri:(NSString *)value {
+#if TARGET_OS_IPHONE
+    NSURL *uri = [NSURL URLWithString:value];
+    if ([uri.scheme isEqualToString:@"asset"]) {
+        NSString *key = [_registrar lookupKeyForAsset:[uri.path substringFromIndex:1]];
+        return [[[NSBundle mainBundle].resourceURL URLByAppendingPathComponent:key] absoluteString];
+    }
+#endif
+    return value;
+}
+
 - (AudioSource *)decodeAudioSource:(NSDictionary *)data {
     NSString *type = data[@"type"];
     if ([@"progressive" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
+        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:[self resolveUri:data[@"uri"]] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
     } else if ([@"dash" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
+        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:[self resolveUri:data[@"uri"]] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
     } else if ([@"hls" isEqualToString:type]) {
-        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:data[@"uri"] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
+        return [[UriAudioSource alloc] initWithId:data[@"id"] uri:[self resolveUri:data[@"uri"]] loadControl:_loadControl headers:data[@"headers"] options:data[@"options"]];
     } else if ([@"concatenating" isEqualToString:type]) {
         return [[ConcatenatingAudioSource alloc] initWithId:data[@"id"]
                                                audioSources:[self decodeAudioSources:data[@"children"]]
@@ -637,7 +650,7 @@
         NSString *type = source[@"child"][@"type"];
         NSString *uri = nil;
         if ([@"progressive" isEqualToString:type] || [@"dash" isEqualToString:type] || [@"hls" isEqualToString:type]) {
-            uri = source[@"child"][@"uri"];
+            uri = [self resolveUri:source[@"child"][@"uri"]];
         }
         if (child && uri && [child.uri isEqualToString:uri]) {
             ClippingAudioSource *clipper =

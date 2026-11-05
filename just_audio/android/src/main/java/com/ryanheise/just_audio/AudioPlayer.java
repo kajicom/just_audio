@@ -53,6 +53,7 @@ import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.Util;
 import io.flutter.Log;
+import io.flutter.embedding.engine.plugins.FlutterPlugin.FlutterAssets;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.EventChannel.EventSink;
@@ -78,6 +79,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private static Random random = new Random();
 
     private final Context context;
+    private final FlutterAssets assets;
     private final MethodChannel methodChannel;
     private final BetterEventChannel eventChannel;
     private final BetterEventChannel dataEventChannel;
@@ -143,6 +145,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     public AudioPlayer(
         final Context applicationContext,
         final BinaryMessenger messenger,
+        final FlutterAssets assets,
         final String id,
         Map<?, ?> audioLoadConfiguration,
         List<Object> rawAudioEffects,
@@ -151,6 +154,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         boolean useLazyPreparation
     ) {
         this.context = applicationContext;
+        this.assets = assets;
         this.rawAudioEffects = rawAudioEffects;
         this.offloadSchedulingEnabled = offloadSchedulingEnabled != null ? offloadSchedulingEnabled : false;
         this.useLazyPreparation = useLazyPreparation;
@@ -637,20 +641,20 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         case "progressive":
             return new ProgressiveMediaSource.Factory(buildDataSourceFactory(mapGet(map, "headers")), buildExtractorsFactory(mapGet(map, "options")))
                     .createMediaSource(new MediaItem.Builder()
-                            .setUri(Uri.parse((String)map.get("uri")))
+                            .setUri(resolveUri((String)map.get("uri")))
                             .setTag(id)
                             .build());
         case "dash":
             return new DashMediaSource.Factory(buildDataSourceFactory(mapGet(map, "headers")))
                     .createMediaSource(new MediaItem.Builder()
-                            .setUri(Uri.parse((String)map.get("uri")))
+                            .setUri(resolveUri((String)map.get("uri")))
                             .setMimeType(MimeTypes.APPLICATION_MPD)
                             .setTag(id)
                             .build());
         case "hls":
             return new HlsMediaSource.Factory(buildDataSourceFactory(mapGet(map, "headers")))
                     .createMediaSource(new MediaItem.Builder()
-                            .setUri(Uri.parse((String)map.get("uri")))
+                            .setUri(resolveUri((String)map.get("uri")))
                             .setMimeType(MimeTypes.APPLICATION_M3U8)
                             .build());
         case "silence":
@@ -726,6 +730,16 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             it.remove();
         }
         audioEffectsMap.clear();
+    }
+
+    // Flutter's logical asset key is independent of the APK's asset directory.
+    // Media3 reads the resolved asset directly, without a temporary file copy.
+    private Uri resolveUri(String value) {
+        Uri uri = Uri.parse(value);
+        if (!"asset".equals(uri.getScheme())) return uri;
+        String key = uri.getPath().substring(1);
+        return new Uri.Builder().scheme("asset")
+                .path("/" + assets.getAssetFilePathByName(key)).build();
     }
 
     private DataSource.Factory buildDataSourceFactory(Map<?, ?> headers) {

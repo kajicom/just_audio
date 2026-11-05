@@ -3,6 +3,7 @@ package com.ryanheise.just_audio;
 import android.content.Context;
 import androidx.annotation.NonNull;
 import io.flutter.plugin.common.BinaryMessenger;
+import io.flutter.embedding.engine.plugins.FlutterPlugin.FlutterAssets;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
@@ -15,13 +16,15 @@ public class MainMethodCallHandler implements MethodCallHandler {
 
     private final Context applicationContext;
     private final BinaryMessenger messenger;
+    private final FlutterAssets assets;
 
     private final Map<String, AudioPlayer> players = new HashMap<>();
 
     public MainMethodCallHandler(Context applicationContext,
-            BinaryMessenger messenger) {
+            BinaryMessenger messenger, FlutterAssets assets) {
         this.applicationContext = applicationContext;
         this.messenger = messenger;
+        this.assets = assets;
     }
 
     @Override
@@ -39,6 +42,7 @@ public class MainMethodCallHandler implements MethodCallHandler {
                 new AudioPlayer(
                     applicationContext,
                     messenger,
+                    assets,
                     id,
                     call.argument("audioLoadConfiguration"),
                     rawAudioEffects,
